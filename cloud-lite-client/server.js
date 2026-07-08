@@ -276,6 +276,10 @@ app.post('/api/sync', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// Catch-all route to serve the React app
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'client', 'dist', 'index.html'));
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Cloud Lite Client running on port ${PORT}`));
