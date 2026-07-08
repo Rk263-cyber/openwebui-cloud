@@ -17,20 +17,48 @@ const pgClient = new Client({
 pgClient.connect().catch(console.error);
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODELS = [
-  'qwen/qwen3-coder:free',
-  'deepseek/deepseek-r1-distill:free',
-  'meta-llama/llama-3.3-70b:free',
-  'openai/gpt-oss-20b:free',
-  'google/gemma-2-27b:free'
-];
 
-async function callOpenRouter(messages) {
-  for (let model of MODELS) {
+let CACHED_MODELS = [];
+
+// Fetch models from DB
+async function getModels() {
+  try {
+    const res = await pgClient.query("SELECT models_list FROM app_config WHERE id = 'default'");
+    if (res.rows.length > 0) {
+      CACHED_MODELS = res.rows[0].models_list;
+    }
+  } catch (e) {
+    console.error("Error fetching models:", e);
+  }
+  return CACHED_MODELS;
+}
+
+// Initial fetch
+getModels();
+
+const DEFAULT_REASONING_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+const PLANNING_SYSTEM_PROMPT = {
+  role: "system",
+  content: "You are a planning and brainstorming partner. When the user describes a project idea or plan, proactively suggest better approaches, point out gaps, and ask 'have you considered X' rather than just accepting the plan at face value. Critique their ideas constructively to arrive at the best possible solution."
+};
+
+async function callOpenRouter(messages, usePlanningPrompt = false) {
+  const models = await getModels();
+  if (!models || models.length === 0) throw new Error("No models configured");
+
+  for (let model of models) {
     try {
+      let finalMessages = [...messages];
+      
+      // Inject planning system prompt if it's the default reasoning model AND planning is requested
+      if (usePlanningPrompt && model === models[0] && model === DEFAULT_REASONING_MODEL) {
+        // Ensure system prompt is first
+        finalMessages = [PLANNING_SYSTEM_PROMPT, ...finalMessages.filter(m => m.role !== 'system')];
+      }
+
       const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
         model,
-        messages
+        messages: finalMessages
       }, {
         headers: {
           'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
@@ -41,6 +69,8 @@ async function callOpenRouter(messages) {
         console.warn(`Model ${model} returned error: ${response.data.error.message}`);
         continue;
       }
+      // Attach the model used so frontend can display it
+      response.data.model_used = model;
       return response.data;
     } catch (err) {
       if (err.response && err.response.status === 429) {
@@ -54,8 +84,26 @@ async function callOpenRouter(messages) {
   throw new Error('All fallback models failed or rate limited');
 }
 
-// Simple unique ID for our shared chat
 const CHAT_ID = 'cloud-lite-chat-1';
+
+// API: Get Models
+app.get('/api/models', async (req, res) => {
+  const models = await getModels();
+  res.json({ models });
+});
+
+// API: Set Models
+app.post('/api/models', async (req, res) => {
+  const { models } = req.body;
+  if (!Array.isArray(models)) return res.status(400).json({ error: "models must be an array" });
+  try {
+    await pgClient.query(`UPDATE app_config SET models_list = $1 WHERE id = 'default'`, [JSON.stringify(models)]);
+    CACHED_MODELS = models;
+    res.json({ success: true, models });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/chat', async (req, res) => {
   try {
@@ -75,15 +123,16 @@ app.post('/api/chat', async (req, res) => {
   const { messages } = req.body;
   
   try {
-    // 1. Get response from OpenRouter
-    const aiResponse = await callOpenRouter(messages);
+    // 1. Get response from OpenRouter, enable planning prompt if applicable
+    const aiResponse = await callOpenRouter(messages, true);
     const assistantMessage = aiResponse.choices[0].message;
+    assistantMessage.model_used = aiResponse.model_used; // attach model used
+    
     const updatedMessages = [...messages, assistantMessage];
 
     // 2. Save to Postgres
     const chatExists = await pgClient.query('SELECT id FROM chat WHERE id = $1', [CHAT_ID]);
     
-    // We mock the user_id since auth isn't fully synced yet
     const USER_ID = '00000000-0000-0000-0000-000000000000'; 
     const TITLE = 'Cloud Lite Chat';
     
@@ -99,6 +148,24 @@ app.post('/api/chat', async (req, res) => {
     }
 
     res.json({ message: assistantMessage, allMessages: updatedMessages });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Turn into build prompt
+app.post('/api/build-prompt', async (req, res) => {
+  const { messages } = req.body;
+  
+  const buildInstructions = {
+    role: "user",
+    content: "Take the full conversation so far as context. First, generate a concise summary of what was discussed, what problem is being solved, and what solution/plan was arrived at. Then, below the summary, generate a complete, execution-ready prompt formatted for pasting directly into an AI agent (Antigravity). The prompt must be specific, step-by-step, no placeholders or ambiguous judgment calls, flagging any step that requires manual user action. Wrap the final prompt in a markdown block."
+  };
+  
+  try {
+    const aiResponse = await callOpenRouter([...messages, buildInstructions], false);
+    res.json({ result: aiResponse.choices[0].message.content });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
