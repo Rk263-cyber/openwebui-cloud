@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud Lite Chat</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; height: 90vh; background: #f9f9f9; }
+        #chat { flex: 1; overflow-y: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: flex; flex-direction: column; gap: 10px; }
+        .message { padding: 10px 15px; border-radius: 15px; max-width: 80%; line-height: 1.4; }
+        .user { background: #007bff; color: white; align-self: flex-end; border-bottom-right-radius: 0; }
+        .assistant { background: #e9ecef; color: black; align-self: flex-start; border-bottom-left-radius: 0; }
+        form { display: flex; gap: 10px; margin-top: 20px; }
+        input { flex: 1; padding: 12px; border: 1px solid #ccc; border-radius: 20px; outline: none; }
+        button { padding: 12px 24px; background: #007bff; color: white; border: none; border-radius: 20px; cursor: pointer; font-weight: bold; }
+        button:disabled { background: #ccc; }
+    </style>
+</head>
+<body>
+    <h2>Cloud Lite Chat</h2>
+    <div id="chat"></div>
+    <form id="form">
+        <input type="text" id="input" placeholder="Type a message..." required autocomplete="off">
+        <button type="submit" id="btn">Send</button>
+    </form>
+
+    <script>
+        let messages = [];
+        const chatDiv = document.getElementById('chat');
+        const form = document.getElementById('form');
+        const input = document.getElementById('input');
+        const btn = document.getElementById('btn');
+
+        function render() {
+            chatDiv.innerHTML = '';
+            messages.forEach(m => {
+                const div = document.createElement('div');
+                div.className = `message ${m.role}`;
+                div.textContent = m.content;
+                chatDiv.appendChild(div);
+            });
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+        }
+
+        async function load() {
+            const res = await fetch('/api/chat');
+            const data = await res.json();
+            messages = data.messages || [];
+            render();
+        }
+
+        form.onsubmit = async (e) => {
+            e.preventDefault();
+            const text = input.value.trim();
+            if(!text) return;
+            
+            messages.push({ role: 'user', content: text });
+            input.value = '';
+            btn.disabled = true;
+            render();
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages })
+                });
+                const data = await res.json();
+                messages = data.allMessages;
+                render();
+            } catch(err) {
+                alert('Error sending message');
+            }
+            btn.disabled = false;
+            input.focus();
+        };
+
+        load();
+    </script>
+</body>
+</html>
