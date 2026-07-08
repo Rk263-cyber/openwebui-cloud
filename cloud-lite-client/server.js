@@ -9,7 +9,8 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'client', 'dist')));
+
 
 const pgClient = new Client({
   connectionString: process.env.DATABASE_URL
@@ -124,9 +125,20 @@ app.get('/api/chats', async (req, res) => {
 // API: Get specific chat
 app.get('/api/chat/:id', async (req, res) => {
   try {
-    const result = await pgClient.query('SELECT chat, title FROM chat WHERE id = $1 AND user_id = $2', [req.params.id, USER_ID]);
-    if (result.rows.length > 0 && result.rows[0].chat) {
-      res.json({ messages: result.rows[0].chat.messages || [], title: result.rows[0].title });
+    const chatResult = await pgClient.query('SELECT title FROM chat WHERE id = $1 AND user_id = $2', [req.params.id, USER_ID]);
+    if (chatResult.rows.length > 0) {
+      const msgResult = await pgClient.query(
+        'SELECT id, role, content, model, created_at FROM cloud_message WHERE conversation_id = $1 ORDER BY created_at ASC',
+        [req.params.id]
+      );
+      // Map to OpenRouter format
+      const messages = msgResult.rows.map(r => ({
+        id: r.id,
+        role: r.role,
+        content: r.content,
+        model_used: r.model
+      }));
+      res.json({ messages: messages, title: chatResult.rows[0].title });
     } else {
       res.status(404).json({ error: 'Chat not found' });
     }
@@ -137,7 +149,7 @@ app.get('/api/chat/:id', async (req, res) => {
 });
 
 app.post('/api/chat', async (req, res) => {
-  let { messages, chatId } = req.body;
+  let { messages, chatId, userMessageId } = req.body;
   let isNewChat = false;
   
   if (!chatId) {
@@ -146,31 +158,47 @@ app.post('/api/chat', async (req, res) => {
   }
   
   try {
-    // 1. Get response from OpenRouter, enable planning prompt if applicable
-    const aiResponse = await callOpenRouter(messages, true);
-    const assistantMessage = aiResponse.choices[0].message;
-    assistantMessage.model_used = aiResponse.model_used; // attach model used
+    // Save the user's message to cloud_message if userMessageId is provided (or generate one)
+    const uMsgId = userMessageId || crypto.randomUUID();
+    const lastUserMsg = messages[messages.length - 1];
     
+    if (lastUserMsg && lastUserMsg.role === 'user') {
+      const exists = await pgClient.query('SELECT id FROM cloud_message WHERE id = $1', [uMsgId]);
+      if (exists.rows.length === 0) {
+        await pgClient.query(`
+          INSERT INTO cloud_message (id, conversation_id, user_id, role, content, created_at, updated_at, device, source)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [uMsgId, chatId, USER_ID, 'user', lastUserMsg.content, Date.now(), Date.now(), 'web', 'cloud-lite']);
+      }
+    }
+
+    // Call OpenRouter
+    const aiResponse = await callOpenRouter(messages.map(m => ({role: m.role, content: m.content})), true);
+    const assistantMessage = aiResponse.choices[0].message;
+    assistantMessage.model_used = aiResponse.model_used;
+    assistantMessage.id = crypto.randomUUID();
+    
+    // Save AI message to cloud_message
+    await pgClient.query(`
+      INSERT INTO cloud_message (id, conversation_id, user_id, role, content, model, created_at, updated_at, device, source)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `, [assistantMessage.id, chatId, USER_ID, 'assistant', assistantMessage.content, aiResponse.model_used, Date.now(), Date.now(), 'web', 'cloud-lite']);
+
     const updatedMessages = [...messages, assistantMessage];
 
-    // 2. Save to Postgres
+    // Create or update chat row
     const chatExists = await pgClient.query('SELECT id FROM chat WHERE id = $1', [chatId]);
-    
     if (chatExists.rows.length === 0) {
-      // Auto-generate title from the first message
       let title = 'New Chat';
       if (messages.length > 0 && messages[0].content) {
         title = messages[0].content.substring(0, 40) + (messages[0].content.length > 40 ? '...' : '');
       }
-      
       await pgClient.query(`
         INSERT INTO chat (id, user_id, title, chat, meta, created_at, updated_at) 
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `, [chatId, USER_ID, title, JSON.stringify({ messages: updatedMessages }), '{}', Date.now(), Date.now()]);
+      `, [chatId, USER_ID, title, '{}', '{}', Date.now(), Date.now()]);
     } else {
-      await pgClient.query(`
-        UPDATE chat SET chat = $1, updated_at = $2 WHERE id = $3
-      `, [JSON.stringify({ messages: updatedMessages }), Date.now(), chatId]);
+      await pgClient.query(`UPDATE chat SET updated_at = $1 WHERE id = $2`, [Date.now(), chatId]);
     }
 
     res.json({ message: assistantMessage, allMessages: updatedMessages, chatId: chatId, isNewChat });
@@ -213,10 +241,38 @@ app.post('/api/build-prompt', async (req, res) => {
   };
   
   try {
-    const aiResponse = await callOpenRouter([...messages, buildInstructions], false);
+    const aiResponse = await callOpenRouter([...messages.map(m=>({role:m.role, content:m.content})), buildInstructions], false);
     res.json({ result: aiResponse.choices[0].message.content });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Sync messages (Offline -> Online)
+app.post('/api/sync', async (req, res) => {
+  const { messages, last_sync } = req.body;
+  try {
+    // 1. Insert/Update incoming messages
+    for (const msg of messages) {
+      await pgClient.query(`
+        INSERT INTO cloud_message (id, conversation_id, user_id, role, content, model, created_at, updated_at, device, source)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (id) DO UPDATE SET
+          content = EXCLUDED.content,
+          updated_at = EXCLUDED.updated_at
+        WHERE cloud_message.updated_at < EXCLUDED.updated_at
+      `, [msg.id, msg.conversation_id, USER_ID, msg.role, msg.content, msg.model || null, msg.created_at, msg.updated_at, msg.device || 'web', msg.source || 'cloud-lite']);
+    }
+
+    // 2. Fetch newer messages from server
+    const result = await pgClient.query(`
+      SELECT * FROM cloud_message WHERE user_id = $1 AND updated_at > $2
+    `, [USER_ID, last_sync || 0]);
+
+    res.json({ success: true, updated_messages: result.rows, server_timestamp: Date.now() });
+  } catch (err) {
+    console.error("Sync error:", err);
     res.status(500).json({ error: err.message });
   }
 });

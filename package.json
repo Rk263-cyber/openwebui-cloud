@@ -1,0 +1,24 @@
+{
+  "name": "openwebui-cloud",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rk263-cyber/openwebui-cloud.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Rk263-cyber/openwebui-cloud/issues"
+  },
+  "homepage": "https://github.com/Rk263-cyber/openwebui-cloud#readme",
+  "dependencies": {
+    "pg": "^8.22.0"
+  }
+}
