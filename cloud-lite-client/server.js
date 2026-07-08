@@ -37,13 +37,18 @@ async function callOpenRouter(messages) {
           'Content-Type': 'application/json'
         }
       });
+      if (response.data.error) {
+        console.warn(`Model ${model} returned error: ${response.data.error.message}`);
+        continue;
+      }
       return response.data;
     } catch (err) {
       if (err.response && err.response.status === 429) {
         console.warn(`Model ${model} rate limited, falling back...`);
         continue;
       }
-      throw err;
+      console.warn(`Model ${model} threw error, falling back...`);
+      continue;
     }
   }
   throw new Error('All fallback models failed or rate limited');
