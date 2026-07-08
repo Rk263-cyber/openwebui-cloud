@@ -54,9 +54,9 @@ const CHAT_ID = 'cloud-lite-chat-1';
 
 app.get('/api/chat', async (req, res) => {
   try {
-    const result = await pgClient.query('SELECT messages FROM chat WHERE id = $1', [CHAT_ID]);
-    if (result.rows.length > 0) {
-      res.json({ messages: result.rows[0].messages });
+    const result = await pgClient.query('SELECT chat FROM chat WHERE id = $1', [CHAT_ID]);
+    if (result.rows.length > 0 && result.rows[0].chat) {
+      res.json({ messages: result.rows[0].chat.messages || [] });
     } else {
       res.json({ messages: [] });
     }
@@ -84,13 +84,13 @@ app.post('/api/chat', async (req, res) => {
     
     if (chatExists.rows.length === 0) {
       await pgClient.query(`
-        INSERT INTO chat (id, user_id, title, messages, created_at, updated_at) 
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [CHAT_ID, USER_ID, TITLE, JSON.stringify(updatedMessages), Date.now(), Date.now()]);
+        INSERT INTO chat (id, user_id, title, chat, meta, created_at, updated_at) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [CHAT_ID, USER_ID, TITLE, JSON.stringify({ messages: updatedMessages }), '{}', Date.now(), Date.now()]);
     } else {
       await pgClient.query(`
-        UPDATE chat SET messages = $1, updated_at = $2 WHERE id = $3
-      `, [JSON.stringify(updatedMessages), Date.now(), CHAT_ID]);
+        UPDATE chat SET chat = $1, updated_at = $2 WHERE id = $3
+      `, [JSON.stringify({ messages: updatedMessages }), Date.now(), CHAT_ID]);
     }
 
     res.json({ message: assistantMessage, allMessages: updatedMessages });
