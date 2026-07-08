@@ -38,10 +38,9 @@ async function getModels() {
 // Initial fetch
 getModels();
 
-const DEFAULT_REASONING_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
-const PLANNING_SYSTEM_PROMPT = {
+const GLOBAL_SYSTEM_PROMPT = {
   role: "system",
-  content: "You are a planning and brainstorming partner. When the user describes a project idea or plan, proactively suggest better approaches, point out gaps, and ask 'have you considered X' rather than just accepting the plan at face value. Critique their ideas constructively to arrive at the best possible solution."
+  content: "You are a helpful, concise, and natural conversational assistant. Answer directly and immediately. Do NOT output huge markdown tables, long essays, or bulleted lists unless explicitly requested. Keep your answers short and conversational. Do not add unnecessary explanations or sections like 'Have you considered...'. If the user wants more detail, they will ask for it."
 };
 
 async function callOpenRouter(messages, usePlanningPrompt = false) {
@@ -52,11 +51,11 @@ async function callOpenRouter(messages, usePlanningPrompt = false) {
     try {
       let finalMessages = [...messages];
       
-      // Inject planning system prompt if it's the default reasoning model AND planning is requested
-      if (usePlanningPrompt && model === models[0] && model === DEFAULT_REASONING_MODEL) {
-        // Ensure system prompt is first
-        finalMessages = [PLANNING_SYSTEM_PROMPT, ...finalMessages.filter(m => m.role !== 'system')];
-      }
+      // Filter out any existing system prompts so we don't conflict
+      finalMessages = finalMessages.filter(m => m.role !== 'system');
+      
+      // Inject GLOBAL_SYSTEM_PROMPT at the very beginning
+      finalMessages.unshift(GLOBAL_SYSTEM_PROMPT);
 
       const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
         model,
@@ -158,17 +157,53 @@ app.post('/api/chat', async (req, res) => {
   }
   
   try {
-    // Save the user's message to cloud_message if userMessageId is provided (or generate one)
     const uMsgId = userMessageId || crypto.randomUUID();
     const lastUserMsg = messages[messages.length - 1];
     
+    // Fetch existing chat JSON if it exists
+    let chatJson = {
+      id: chatId,
+      title: "New Chat",
+      models: [],
+      history: { currentId: null, messages: {} },
+      messages: [],
+      timestamp: Date.now()
+    };
+    
+    const chatExists = await pgClient.query('SELECT chat FROM chat WHERE id = $1', [chatId]);
+    if (chatExists.rows.length > 0) {
+      if (typeof chatExists.rows[0].chat === 'string') {
+        try { chatJson = JSON.parse(chatExists.rows[0].chat); } catch(e){}
+      } else if (chatExists.rows[0].chat) {
+        chatJson = chatExists.rows[0].chat;
+      }
+    }
+    
+    // Append User Message to Tree
+    let parentId = chatJson.history.currentId || null;
+    if (parentId && chatJson.history.messages[parentId]) {
+      if (!chatJson.history.messages[parentId].childrenIds.includes(uMsgId)) {
+        chatJson.history.messages[parentId].childrenIds.push(uMsgId);
+      }
+    }
+    
+    chatJson.history.messages[uMsgId] = {
+      id: uMsgId,
+      parentId: parentId,
+      childrenIds: [],
+      role: 'user',
+      content: lastUserMsg.content,
+      timestamp: Math.floor(Date.now() / 1000)
+    };
+    chatJson.history.currentId = uMsgId;
+
     if (lastUserMsg && lastUserMsg.role === 'user') {
       const exists = await pgClient.query('SELECT id FROM cloud_message WHERE id = $1', [uMsgId]);
       if (exists.rows.length === 0) {
         await pgClient.query(`
-          INSERT INTO cloud_message (id, conversation_id, user_id, role, content, created_at, updated_at, device, source)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [uMsgId, chatId, USER_ID, 'user', lastUserMsg.content, Date.now(), Date.now(), 'web', 'cloud-lite']);
+          INSERT INTO cloud_message (id, conversation_id, user_id, role, content, created_at, updated_at, device, source, parent_id)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        `, [uMsgId, chatId, USER_ID, 'user', lastUserMsg.content, Date.now(), Date.now(), 'web', 'cloud-lite', parentId]);
       }
     }
 
@@ -176,29 +211,43 @@ app.post('/api/chat', async (req, res) => {
     const aiResponse = await callOpenRouter(messages.map(m => ({role: m.role, content: m.content})), true);
     const assistantMessage = aiResponse.choices[0].message;
     assistantMessage.model_used = aiResponse.model_used;
-    assistantMessage.id = crypto.randomUUID();
+    const aMsgId = crypto.randomUUID();
+    assistantMessage.id = aMsgId;
     
+    // Append Assistant Message to Tree
+    chatJson.history.messages[uMsgId].childrenIds.push(aMsgId);
+    chatJson.history.messages[aMsgId] = {
+      id: aMsgId,
+      parentId: uMsgId,
+      childrenIds: [],
+      role: 'assistant',
+      content: assistantMessage.content,
+      model: aiResponse.model_used,
+      timestamp: Math.floor(Date.now() / 1000)
+    };
+    chatJson.history.currentId = aMsgId;
+    if (!chatJson.models.includes(aiResponse.model_used)) chatJson.models.push(aiResponse.model_used);
+    
+    if (isNewChat && messages.length > 0 && messages[0].content) {
+      chatJson.title = messages[0].content.substring(0, 40) + (messages[0].content.length > 40 ? '...' : '');
+    }
+
     // Save AI message to cloud_message
     await pgClient.query(`
-      INSERT INTO cloud_message (id, conversation_id, user_id, role, content, model, created_at, updated_at, device, source)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    `, [assistantMessage.id, chatId, USER_ID, 'assistant', assistantMessage.content, aiResponse.model_used, Date.now(), Date.now(), 'web', 'cloud-lite']);
+      INSERT INTO cloud_message (id, conversation_id, user_id, role, content, model, created_at, updated_at, device, source, parent_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `, [aMsgId, chatId, USER_ID, 'assistant', assistantMessage.content, aiResponse.model_used, Date.now(), Date.now(), 'web', 'cloud-lite', uMsgId]);
 
     const updatedMessages = [...messages, assistantMessage];
 
-    // Create or update chat row
-    const chatExists = await pgClient.query('SELECT id FROM chat WHERE id = $1', [chatId]);
-    if (chatExists.rows.length === 0) {
-      let title = 'New Chat';
-      if (messages.length > 0 && messages[0].content) {
-        title = messages[0].content.substring(0, 40) + (messages[0].content.length > 40 ? '...' : '');
-      }
+    // Create or update chat row with full JSON tree
+    if (isNewChat) {
       await pgClient.query(`
         INSERT INTO chat (id, user_id, title, chat, meta, created_at, updated_at) 
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `, [chatId, USER_ID, title, '{}', '{}', Date.now(), Date.now()]);
+      `, [chatId, USER_ID, chatJson.title, JSON.stringify(chatJson), '{}', Date.now(), Date.now()]);
     } else {
-      await pgClient.query(`UPDATE chat SET updated_at = $1 WHERE id = $2`, [Date.now(), chatId]);
+      await pgClient.query(`UPDATE chat SET chat = $1, updated_at = $2 WHERE id = $3`, [JSON.stringify(chatJson), Date.now(), chatId]);
     }
 
     res.json({ message: assistantMessage, allMessages: updatedMessages, chatId: chatId, isNewChat });
@@ -249,33 +298,7 @@ app.post('/api/build-prompt', async (req, res) => {
   }
 });
 
-// API: Sync messages (Offline -> Online)
-app.post('/api/sync', async (req, res) => {
-  const { messages, last_sync } = req.body;
-  try {
-    // 1. Insert/Update incoming messages
-    for (const msg of messages) {
-      await pgClient.query(`
-        INSERT INTO cloud_message (id, conversation_id, user_id, role, content, model, created_at, updated_at, device, source)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (id) DO UPDATE SET
-          content = EXCLUDED.content,
-          updated_at = EXCLUDED.updated_at
-        WHERE cloud_message.updated_at < EXCLUDED.updated_at
-      `, [msg.id, msg.conversation_id, USER_ID, msg.role, msg.content, msg.model || null, msg.created_at, msg.updated_at, msg.device || 'web', msg.source || 'cloud-lite']);
-    }
-
-    // 2. Fetch newer messages from server
-    const result = await pgClient.query(`
-      SELECT * FROM cloud_message WHERE user_id = $1 AND updated_at > $2
-    `, [USER_ID, last_sync || 0]);
-
-    res.json({ success: true, updated_messages: result.rows, server_timestamp: Date.now() });
-  } catch (err) {
-    console.error("Sync error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// Removed obsolete /api/sync endpoint as sync is handled by Event-Driven Sync Engine
 // Catch-all route to serve the React app
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'client', 'dist', 'index.html'));
